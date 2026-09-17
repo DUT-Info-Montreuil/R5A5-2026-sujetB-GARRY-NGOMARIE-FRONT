@@ -18,17 +18,16 @@ export default defineConfig({
       usePolling: true,
     },
     proxy: {
+      // WebSocket routes live under /api/v1/... alongside the REST ones
+      // (see BACK docs/api-realtime.md), so /api itself must upgrade too.
       '/api': {
         target: 'http://back:8000',
         changeOrigin: true,
+        ws: true,
       },
       '/health': {
         target: 'http://back:8000',
         changeOrigin: true,
-      },
-      '/ws': {
-        target: 'ws://back:8000',
-        ws: true,
       },
     },
   },

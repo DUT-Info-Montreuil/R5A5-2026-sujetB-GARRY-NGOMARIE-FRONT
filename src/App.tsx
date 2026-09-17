@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import {
   Card,
   CardHeader,
@@ -33,6 +33,11 @@ import {
   Lock,
   Flag,
   Swords,
+  MessageSquare,
+  Send,
+  Wifi,
+  WifiOff,
+  Ban,
 } from "lucide-react"
 
 interface ApiUser {
@@ -96,6 +101,32 @@ interface MatchItem {
   next_match_slot: number | null
 }
 
+interface ChatMessage {
+  id: string
+  team_id: string
+  author_id: string | null
+  author_username: string | null
+  content: string
+  created_at: string
+}
+
+interface ChatFrame {
+  type?: string
+  event?: string
+  reason?: string
+  detail?: string
+  room?: string
+  data?: ChatMessage
+}
+
+interface WsLogEntry {
+  timestamp: string
+  kind: "info" | "system" | "message" | "error"
+  text: string
+}
+
+type WsStatus = "disconnected" | "connecting" | "connected" | "revoked" | "error"
+
 interface ApiResponseLog {
   timestamp: string
   method: string
@@ -141,6 +172,13 @@ export default function App() {
   const [assignRoleValue, setAssignRoleValue] = useState("Support")
   const [excludeMemberId, setExcludeMemberId] = useState("")
   const [transferNewCaptainId, setTransferNewCaptainId] = useState("")
+
+  // --- Espace d'échange d'équipe (B-16, B-17, B-18) ---
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
+  const [chatInput, setChatInput] = useState("Salut l'équipe !")
+  const [wsStatus, setWsStatus] = useState<WsStatus>("disconnected")
+  const [wsLog, setWsLog] = useState<WsLogEntry[]>([])
+  const wsRef = useRef<WebSocket | null>(null)
 
   // --- Matchs & Lancement ---
   const [matches, setMatches] = useState<MatchItem[]>([])
@@ -401,6 +439,107 @@ export default function App() {
     }
   }
 
+  // --- Espace d'échange (B-16 REST + WebSocket, B-17 exclusion, B-18 élimination) ---
+  const pushWsLog = (kind: WsLogEntry["kind"], text: string) => {
+    setWsLog((prev) => [
+      { timestamp: new Date().toLocaleTimeString(), kind, text },
+      ...prev.slice(0, 29),
+    ])
+  }
+
+  const closeSocket = () => {
+    wsRef.current?.close()
+    wsRef.current = null
+  }
+
+  const handleLoadMessages = async () => {
+    if (!selectedTeam) return
+    const res = await executeApi("GET", `/api/v1/teams/${selectedTeam.id}/messages`)
+    if (res.ok && Array.isArray(res.data)) {
+      setChatMessages(res.data as ChatMessage[])
+    }
+  }
+
+  const handleSendMessageRest = async () => {
+    if (!selectedTeam || !chatInput.trim()) return
+    const res = await executeApi("POST", `/api/v1/teams/${selectedTeam.id}/messages`, {
+      content: chatInput,
+    })
+    if (res.ok) {
+      setChatInput("")
+      // Si le WebSocket est connecté, le nouveau message arrive par diffusion ;
+      // sinon on retombe sur le REST (repli décrit dans docs/api-realtime.md).
+      if (wsStatus !== "connected") handleLoadMessages()
+    }
+  }
+
+  const handleConnectWs = () => {
+    if (!selectedTeam || !authToken) return
+    closeSocket()
+    setWsStatus("connecting")
+    const protocol = window.location.protocol === "https:" ? "wss" : "ws"
+    const ws = new WebSocket(
+      `${protocol}://${window.location.host}/api/v1/teams/${selectedTeam.id}/ws?token=${authToken}`
+    )
+    wsRef.current = ws
+
+    ws.onerror = () => {
+      setWsStatus("error")
+      pushWsLog("error", "Erreur de connexion WebSocket")
+    }
+    ws.onclose = (ev) => {
+      setWsStatus((prev) => (prev === "revoked" ? prev : "disconnected"))
+      pushWsLog("info", `Socket fermé (code ${ev.code})`)
+    }
+    ws.onmessage = (ev) => {
+      let frame: ChatFrame
+      try {
+        frame = JSON.parse(ev.data)
+      } catch {
+        pushWsLog("error", `Trame illisible : ${ev.data}`)
+        return
+      }
+      if (frame.type === "system" && frame.event === "connected") {
+        setWsStatus("connected")
+        pushWsLog("system", `Connecté à la salle ${frame.room}`)
+      } else if (frame.type === "system" && frame.event === "revoked") {
+        setWsStatus("revoked")
+        pushWsLog("system", `Accès révoqué (raison : ${frame.reason})`)
+      } else if (frame.type === "message" && frame.data) {
+        const msg = frame.data
+        setChatMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]))
+        pushWsLog("message", `${msg.author_username || "?"} : ${msg.content}`)
+      } else if (frame.type === "error") {
+        pushWsLog("error", frame.detail || "Erreur")
+      }
+    }
+  }
+
+  const handleDisconnectWs = () => {
+    closeSocket()
+    setWsStatus("disconnected")
+  }
+
+  const handleSendMessageWs = () => {
+    if (!wsRef.current || wsStatus !== "connected" || !chatInput.trim()) return
+    wsRef.current.send(JSON.stringify({ type: "message", content: chatInput }))
+    setChatInput("")
+  }
+
+  // Changer d'équipe ou d'utilisateur invalide la session WebSocket active :
+  // un jeton ou une salle différents nécessitent une reconnexion explicite.
+  useEffect(() => {
+    closeSocket()
+    setWsStatus("disconnected")
+    setChatMessages([])
+    setWsLog([])
+  }, [selectedTeam?.id, currentUser.id])
+
+  // Coupe le socket si le composant est démonté (navigation, rechargement).
+  useEffect(() => {
+    return () => closeSocket()
+  }, [])
+
   // --- Lancement & Gestion des Matchs / Scores ---
   const handleCloseRegistration = async () => {
     if (!selectedTournament) return
@@ -594,7 +733,7 @@ export default function App() {
 
         {/* Onglets des Fonctionnalités de l'API */}
         <Tabs defaultValue="tournaments" className="space-y-4">
-          <TabsList className="grid grid-cols-2 md:grid-cols-5 w-full h-auto p-1 gap-1">
+          <TabsList className="grid grid-cols-2 md:grid-cols-6 w-full h-auto p-1 gap-1">
             <TabsTrigger value="tournaments" className="flex items-center gap-2 py-2">
               <Trophy className="h-4 w-4" />
               1. Tournois
@@ -611,9 +750,13 @@ export default function App() {
               <Swords className="h-4 w-4" />
               4. Matchs & Scores
             </TabsTrigger>
+            <TabsTrigger value="chat" className="flex items-center gap-2 py-2">
+              <MessageSquare className="h-4 w-4" />
+              5. Chat Équipe
+            </TabsTrigger>
             <TabsTrigger value="users" className="flex items-center gap-2 py-2">
               <UserPlus className="h-4 w-4" />
-              5. Nouvel User
+              6. Nouvel User
             </TabsTrigger>
           </TabsList>
 
@@ -1462,7 +1605,219 @@ export default function App() {
             </Card>
           </TabsContent>
 
-          {/* TAB 5: CRÉER UTILISATEUR */}
+          {/* TAB 5: ESPACE D'ÉCHANGE D'ÉQUIPE (B-16, B-17, B-18) */}
+          <TabsContent value="chat" className="space-y-4">
+            <Card className="bg-primary/5 border-primary/20">
+              <CardContent className="pt-4 pb-4 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+                <div>
+                  <div className="text-xs text-muted-foreground font-medium">
+                    ESPACE D'ÉCHANGE DE L'ÉQUIPE ACTIVE (B-16, B-17, B-18)
+                  </div>
+                  <div className="text-lg font-bold flex items-center gap-2">
+                    {selectedTeam ? selectedTeam.name : "Aucune équipe sélectionnée"}
+                    {selectedTeam?.is_eliminated && (
+                      <Badge variant="destructive" className="text-xs font-normal">
+                        Éliminée — espace fermé (B-18)
+                      </Badge>
+                    )}
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Connecté en tant que {currentUser.username}. Choisissez une équipe (onglet 2) ;
+                    excluez un membre depuis l'onglet 3 pour observer B-17 en direct ici.
+                  </p>
+                </div>
+                <Badge
+                  variant={
+                    wsStatus === "connected"
+                      ? "success"
+                      : wsStatus === "connecting"
+                      ? "warning"
+                      : wsStatus === "revoked" || wsStatus === "error"
+                      ? "destructive"
+                      : "secondary"
+                  }
+                  className="flex items-center gap-1.5 text-xs whitespace-nowrap"
+                >
+                  {wsStatus === "connected" ? (
+                    <Wifi className="h-3 w-3" />
+                  ) : wsStatus === "revoked" ? (
+                    <Ban className="h-3 w-3" />
+                  ) : (
+                    <WifiOff className="h-3 w-3" />
+                  )}
+                  {
+                    {
+                      disconnected: "Déconnecté",
+                      connecting: "Connexion...",
+                      connected: "Connecté",
+                      revoked: "Accès révoqué",
+                      error: "Erreur",
+                    }[wsStatus]
+                  }
+                </Badge>
+              </CardContent>
+            </Card>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              {/* Messages */}
+              <Card className="md:col-span-2">
+                <CardHeader className="pb-3">
+                  <div className="flex items-center justify-between flex-wrap gap-2">
+                    <div>
+                      <CardTitle className="text-sm font-semibold flex items-center gap-1.5">
+                        <MessageSquare className="h-4 w-4" />
+                        Messages (GET/POST .../messages, WS .../ws)
+                      </CardTitle>
+                      <CardDescription>
+                        Lecture : membre courant ou admin. Écriture : membre courant, équipe non éliminée.
+                      </CardDescription>
+                    </div>
+                    <div className="flex gap-1.5">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleLoadMessages}
+                        disabled={!selectedTeam}
+                        className="text-xs"
+                      >
+                        <RefreshCw className="h-3 w-3 mr-1" />
+                        Historique
+                      </Button>
+                      {wsStatus === "connected" || wsStatus === "connecting" ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={handleDisconnectWs}
+                          className="text-xs"
+                        >
+                          <WifiOff className="h-3 w-3 mr-1" />
+                          Déconnecter
+                        </Button>
+                      ) : (
+                        <Button
+                          size="sm"
+                          onClick={handleConnectWs}
+                          disabled={!selectedTeam || !authToken}
+                          className="text-xs"
+                        >
+                          <Wifi className="h-3 w-3 mr-1" />
+                          Connecter le WS
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  <div className="space-y-2 max-h-72 overflow-y-auto p-2 rounded-md border bg-muted/30">
+                    {chatMessages.length === 0 ? (
+                      <div className="text-xs text-muted-foreground text-center py-8">
+                        Aucun message. Chargez l'historique ou connectez le WebSocket.
+                      </div>
+                    ) : (
+                      chatMessages.map((m) => {
+                        const isMine = m.author_id === currentUser.id
+                        return (
+                          <div
+                            key={m.id}
+                            className={`text-xs p-2 rounded-md max-w-[85%] ${
+                              isMine
+                                ? "ml-auto bg-primary text-primary-foreground"
+                                : "bg-card border"
+                            }`}
+                          >
+                            <div className="font-semibold flex items-center justify-between gap-2">
+                              <span>{m.author_username || "Système"}</span>
+                              <span
+                                className={`text-[10px] font-normal ${
+                                  isMine
+                                    ? "text-primary-foreground/70"
+                                    : "text-muted-foreground"
+                                }`}
+                              >
+                                {new Date(m.created_at).toLocaleTimeString()}
+                              </span>
+                            </div>
+                            <div className="mt-0.5 break-words">{m.content}</div>
+                          </div>
+                        )
+                      })
+                    )}
+                  </div>
+                  <div className="flex gap-1.5">
+                    <Input
+                      value={chatInput}
+                      onChange={(e) => setChatInput(e.target.value)}
+                      placeholder="Votre message..."
+                      onKeyDown={(e) => {
+                        if (e.key !== "Enter") return
+                        if (wsStatus === "connected") handleSendMessageWs()
+                        else handleSendMessageRest()
+                      }}
+                    />
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={handleSendMessageRest}
+                      disabled={!selectedTeam || !chatInput.trim()}
+                      className="text-xs whitespace-nowrap"
+                    >
+                      <Send className="h-3 w-3 mr-1" />
+                      REST
+                    </Button>
+                    <Button
+                      size="sm"
+                      onClick={handleSendMessageWs}
+                      disabled={wsStatus !== "connected" || !chatInput.trim()}
+                      className="text-xs whitespace-nowrap"
+                    >
+                      <Send className="h-3 w-3 mr-1" />
+                      WS
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+
+              {/* Journal WebSocket */}
+              <Card>
+                <CardHeader className="pb-3">
+                  <CardTitle className="text-sm font-semibold flex items-center gap-1.5">
+                    <Radio className="h-4 w-4" />
+                    Journal WebSocket
+                  </CardTitle>
+                  <CardDescription>
+                    Trames système (connexion, révocation B-17/B-18) et erreurs.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-1.5 max-h-96 overflow-y-auto text-xs font-mono">
+                  {wsLog.length === 0 ? (
+                    <div className="text-muted-foreground text-center py-6">
+                      Aucun événement.
+                    </div>
+                  ) : (
+                    wsLog.map((entry, i) => (
+                      <div
+                        key={i}
+                        className={`p-1.5 rounded border ${
+                          entry.kind === "error"
+                            ? "border-destructive/40 bg-destructive/5 text-destructive"
+                            : entry.kind === "system"
+                            ? "border-amber-500/40 bg-amber-500/5"
+                            : entry.kind === "message"
+                            ? "border-primary/30 bg-primary/5"
+                            : "border-border bg-muted/40 text-muted-foreground"
+                        }`}
+                      >
+                        <span className="text-[10px] opacity-70">{entry.timestamp}</span>{" "}
+                        — {entry.text}
+                      </div>
+                    ))
+                  )}
+                </CardContent>
+              </Card>
+            </div>
+          </TabsContent>
+
+          {/* TAB 6: CRÉER UTILISATEUR */}
           <TabsContent value="users" className="space-y-4">
             <Card className="max-w-md mx-auto">
               <CardHeader className="pb-3">
